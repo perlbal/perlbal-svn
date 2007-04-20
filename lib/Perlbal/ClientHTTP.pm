@@ -20,6 +20,7 @@ use fields ('put_in_progress', # 1 when we're currently waiting for an async job
 
             'content_length',  # length of document being transferred
             'content_length_remain', # bytes remaining to be read
+            'chunked_upload_state', # bool/obj:  if processing a chunked upload, Perlbal::ChunkedUploadState object, else undef
             );
 
 use HTTP::Date ();
@@ -129,6 +130,8 @@ sub handle_put {
 
     return $self->send_response(403) unless $self->{service}->{enable_put};
 
+    return if $self->handle_put_chunked;
+
     # they want to put something, so let's setup and wait for more reads
     my $clen =
         $self->{content_length} =
@@ -189,6 +192,84 @@ sub handle_put {
     return;
 }
 
+sub handle_put_chunked {
+    my Perlbal::ClientHTTP $self = shift;
+    my $req_hd = $self->{req_headers};
+    my $te = $req_hd->header("Transfer-Encoding");
+    return unless $te && $te eq "chunked";
+
+    my $eh = $req_hd->header("Expect");
+    if ($eh && $eh =~ /\b100-continue\b/) {
+        $self->write(\ "HTTP/1.1 100 Continue\r\n\r\n");
+    }
+
+    my $max_size = $self->{service}{max_chunked_request_size};
+
+    # error in filename?  (any .. is an error)
+    my $uri = $self->{req_headers}->request_uri;
+    return $self->send_response(400, 'Invalid filename')
+        if $uri =~ /\.\./;
+
+    # now we want to get the URI
+    return $self->send_response(400, 'Invalid filename')
+        unless $uri =~ m!^
+            ((?:/[\w\-\.]+)*)      # $1: zero+ path components of /FOO where foo is
+                                     #   one+ conservative characters
+                  /                  # path separator
+            ([\w\-\.]+)            # $2: and the filename, one+ conservative characters
+            $!x;
+
+    # sanitize uri into path and file into a disk path and filename
+    my ($path, $filename) = ($1 || '', $2);
+
+    my $disk_path = $self->{service}->{docroot} . '/' . $path;
+    $self->start_put_open($disk_path, $filename);
+
+    my $args = {
+        on_new_chunk => sub {
+            my $cref = shift;
+            my $len = length($$cref);
+            push @{$self->{read_buf}}, $cref;
+            $self->{read_ahead}          += $len;
+            $self->{content_length} += $len; # This variable needs to be moved up into ClientHTTPBase
+
+            # if too large, disconnect them...
+            if ($max_size && $self->{content_length} > $max_size) {
+                $self->chunked_request_oversized;
+                $self->close;
+                return;
+            }
+            $self->chunked_request_update;
+        },
+        on_disconnect => sub {
+            $self->client_disconnected;
+        },
+        on_zero_chunk => sub {
+            $self->chunked_request_finished;
+        },
+    };
+
+    $self->{chunked_upload_state} = Perlbal::ChunkedUploadState->new(%$args);
+    return 1;
+}
+
+sub chunked_request_oversized {
+    my Perlbal::ClientHTTP $self = shift;
+}
+
+sub chunked_request_update {
+    my Perlbal::ClientHTTP $self = shift;
+    $self->put_writeout if $self->{read_ahead} >= 8192; # arbitrary
+}
+
+sub chunked_request_finished {
+    my Perlbal::ClientHTTP $self = shift;
+    $self->{chunked_upload_state} = undef;
+    $self->watch_read(0);
+    $self->put_writeout;
+    $self->put_close;
+}
+
 # called when we're requested to do a delete
 sub handle_delete {
     my Perlbal::ClientHTTP $self = shift;
@@ -226,6 +307,12 @@ sub handle_delete {
 
 sub event_read_put {
     my Perlbal::ClientHTTP $self = shift;
+
+    if (my $cus = $self->{chunked_upload_state}) {
+        $cus->on_readable($self);
+        # Do I need to check for an overfull buffer here?
+        return;
+    }
 
     # read in data and shove it on the read buffer
     my $dataref = $self->read($self->{content_length_remain});
@@ -348,17 +435,23 @@ sub put_writeout {
             return;
         }
 
-        return if $self->{content_length_remain};
+        return if $self->{content_length_remain} || $self->{chunked_upload_state};
 
         # we're done putting this file, so close it.
         # FIXME this should be done through AIO
-        if ($self->{put_fh} && CORE::close($self->{put_fh})) {
-            $self->{put_fh} = undef;
-            return $self->send_response(200);
-        } else {
-            return $self->system_error("Error saving file", "error in close: $!");
-        }
+        $self->put_close;
     });
+}
+
+sub put_close {
+    my Perlbal::ClientHTTP $self = shift;
+    return if $self->{put_in_progress};
+    if ($self->{put_fh} && CORE::close($self->{put_fh})) {
+        $self->{put_fh} = undef;
+        return $self->send_response(200);
+    } else {
+        return $self->system_error("Error saving file", "error in close: $!");
+    }
 }
 
 1;
