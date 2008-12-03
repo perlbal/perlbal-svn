@@ -196,7 +196,11 @@ sub close {
 
     # tell our client that we're gone
     if (my $client = $self->{client}) {
-        $client->backend(undef);
+        if ($client->can('backend')) {
+            $client->backend(undef);
+        } else {
+            Perlbal::log('crit', "Unknown reverse proxy glitch, our client isn't a reverse proxy?");
+        }
         $self->{client} = undef;
     }
 
